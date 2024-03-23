@@ -113,21 +113,29 @@ __global__ void duplicateWithKeys(
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
 // Run once per instanced (duplicated) Gaussian ID.
-__global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
+__global__ void identifyTileRanges(
+	uint64_t* point_list_keys, 
+	const uint32_t* offsets,
+	const int p,
+	const int img_size,
+	uint2* ranges)
 {
 	auto idx = cg::this_grid().thread_rank();
+	auto L = offsets[p];
 	if (idx >= L)
 		return;
 
 	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint64_t key = point_list_keys[idx];
 	uint32_t currtile = key >> 32;
+	if (currtile >= img_size)
+		return;
 	if (idx == 0)
 		ranges[currtile].x = 0;
 	else
 	{
 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
-		if (currtile != prevtile)
+		if (currtile != prevtile && prevtile < img_size)
 		{
 			ranges[prevtile].y = idx;
 			ranges[currtile].x = idx;
@@ -222,6 +230,8 @@ int CudaRasterizer::Rasterizer::forward(
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
+	
+	// debug = true;
 
 	size_t chunk_size = required<GeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
@@ -279,14 +289,17 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	// CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	// printf("Number of rendered Gaussians: %d\n", num_rendered);
+
+	num_rendered = 4'000'000;
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
-	// and corresponding dublicated Gaussian indices to be sorted
+	// and corresponding duplicated Gaussian indices to be sorted
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -310,21 +323,28 @@ int CudaRasterizer::Rasterizer::forward(
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
+	// printf("SortPairs succeeded\n");
+
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
-		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
-			num_rendered,
+		identifyTileRanges <<<(num_rendered + 255) / 256, 256>>> (
 			binningState.point_list_keys,
+			geomState.point_offsets,
+			P - 1,
+			width * height,
 			imgState.ranges);
 	CHECK_CUDA(, debug);
 
+	// printf("identifyTileRanges succeeded\n");
+
 	// Let each tile blend its range of Gaussians independently in parallel
+	// printf("colors_precomp != nullptr: %d\n", colors_precomp != nullptr);
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
-		width, height,
+		P, width, height,
 		geomState.means2D,
 		feature_ptr,
 		geomState.depths,
@@ -334,6 +354,8 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		out_depth), debug);
+
+	// printf("FORWARD::render succeeded\n");
 
 	return num_rendered;
 }
